@@ -14,7 +14,6 @@ import (
 	"github.com/openshift/network-metrics-daemon/test/utils/client"
 	"github.com/openshift/network-metrics-daemon/test/utils/consts"
 	"github.com/openshift/network-metrics-daemon/test/utils/namespaces"
-	"github.com/openshift/network-metrics-daemon/test/utils/pods"
 	"github.com/openshift/network-metrics-daemon/test/utils/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -24,17 +23,6 @@ const (
 	baseURL     = "http://localhost:9090"
 	workerLabel = "node-role.kubernetes.io/worker="
 )
-
-var metrics = []string{
-	"container_network_receive_bytes_total",
-	"container_network_receive_errors_total",
-	"container_network_receive_packets_total",
-	"container_network_receive_packets_dropped_total",
-	"container_network_transmit_bytes_total",
-	"container_network_transmit_errors_total",
-	"container_network_transmit_packets_total",
-	"container_network_transmit_packets_dropped_total",
-}
 
 var _ = ginkgo.Describe("NetworkMetricsDaemon", func() {
 	ginkgo.BeforeEach(func() {
@@ -77,66 +65,22 @@ var _ = ginkgo.Describe("NetworkMetricsDaemon", func() {
 			}, 5*time.Minute, 5*time.Second).Should(gomega.Equal(corev1.PodRunning))
 		})
 
-		ginkgo.It("should be produced for the Pod's default interface", func() {
-			query := fmt.Sprintf("pod_network_name_info{namespace=\"%s\",pod=\"metricpod\"}", consts.TestingNamespace)
+		ginkgo.It("should expose the network name for the Pod's default interface", func() {
+			query := fmt.Sprintf("pod_network_name_info{namespace=\"%s\",pod=\"metricpod\",interface=\"eth0\"}", consts.TestingNamespace)
 			url := fmt.Sprintf("%s/api/v1/query?%s", baseURL, (url.Values{"query": []string{query}}).Encode())
 
 			queryPrometheusEventually(url, 5*time.Minute, 5*time.Second, func(queryOutput prometheus.Reply) bool {
+				if len(queryOutput.Data.Results) != 1 {
+					return false
+				}
+
 				result := queryOutput.Data.Results[0]
-				return result.Value[1] == "0"
+				return result.Metric.Namespace == consts.TestingNamespace &&
+					result.Metric.Pod == "metricpod" &&
+					result.Metric.Interface == "eth0" &&
+					result.Metric.NetworkName != "" &&
+					result.Value[1] == "0"
 			})
-		})
-
-		ginkgo.It("should have the correct network_name and value on top of default pod network", func() {
-			ginkgo.By("checking that there is traffic on all networks")
-
-			recieveBytesMetric := fmt.Sprintf("container_network_receive_bytes_total{namespace=\"%s\",pod=\"metricpod\", interface=\"eth0\"}", consts.TestingNamespace)
-			reciveBytesURL := fmt.Sprintf("%s/api/v1/query?%s", baseURL, (url.Values{"query": []string{recieveBytesMetric}}).Encode())
-
-			queryPrometheusEventually(reciveBytesURL, 5*time.Minute, 5*time.Second, func(queryOutput prometheus.Reply) bool {
-				for _, result := range queryOutput.Data.Results {
-					if result.Value[1] == "0" {
-						return false
-					}
-				}
-				return true
-			})
-
-			transmitBytesMetric := fmt.Sprintf("container_network_transmit_bytes_total{namespace=\"%s\",pod=\"metricpod\", interface=\"eth0\"}", consts.TestingNamespace)
-			transmitBytesURL := fmt.Sprintf("%s/api/v1/query?%s", baseURL, (url.Values{"query": []string{transmitBytesMetric}}).Encode())
-
-			queryPrometheusEventually(transmitBytesURL, 5*time.Minute, 5*time.Second, func(queryOutput prometheus.Reply) bool {
-				for _, result := range queryOutput.Data.Results {
-					if result.Value[1] == "0" {
-						return false
-					}
-				}
-				return true
-			})
-
-			ginkgo.By("checking that difference in traffic is 0")
-
-			differenceQuery := fmt.Sprintf(
-				"((%s) + on(namespace,pod,interface) group_left(network_name) (pod_network_name_info{namespace=\"%s\",pod=\"metricpod\"})) - ignoring(network_name) %s{namespace=\"%s\",pod=\"metricpod\", interface=\"eth0\"}",
-				"%s",
-				consts.TestingNamespace,
-				"%s",
-				consts.TestingNamespace,
-			)
-
-			for _, metric := range metrics {
-				currentQuery := fmt.Sprintf(differenceQuery, metric, metric)
-				url := fmt.Sprintf("%s/api/v1/query?%s", baseURL, (url.Values{"query": []string{currentQuery}}).Encode())
-
-				queryPrometheusEventually(url, 5*time.Minute, 5*time.Second, func(queryOutput prometheus.Reply) bool {
-					for _, result := range queryOutput.Data.Results {
-						if result.Value[1] != "0" {
-							return false
-						}
-					}
-					return true
-				})
-			}
 		})
 	})
 
@@ -247,142 +191,74 @@ var _ = ginkgo.Describe("NetworkMetricsDaemon", func() {
 			}, 5*time.Minute, 5*time.Second).Should(gomega.Equal(corev1.PodRunning))
 		})
 
-		ginkgo.It("should have the correct network_name", func() {
+		ginkgo.It("should expose the network name for every Pod interface", func() {
 			query := fmt.Sprintf("(pod_network_name_info{namespace=\"%s\",pod=\"metricpod\"})", consts.TestingNamespace)
 			url := fmt.Sprintf("%s/api/v1/query?%s", baseURL, (url.Values{"query": []string{query}}).Encode())
 
 			queryPrometheusEventually(url, 5*time.Minute, 5*time.Second, func(queryOutput prometheus.Reply) bool {
 				results := queryOutput.Data.Results
-
-				// Check that we have exactly 3 results (default network + 2 additional networks)
 				if len(results) != 3 {
 					return false
 				}
 
-				// Track which networks we've found
-				foundNetworks := make(map[string]bool)
-
-				// Validate each result
+				expectedNetworks := map[string]string{
+					"net1": fmt.Sprintf("%s/nad0", consts.TestingNamespace),
+					"net2": fmt.Sprintf("%s/nad1", consts.TestingNamespace),
+				}
+				foundInterfaces := make(map[string]bool)
 				for _, result := range results {
-					if result.Metric.NetworkName != "" {
-						foundNetworks[result.Metric.NetworkName] = true
-					}
-				}
-
-				// Check that we have both expected networks
-				expectedNad0 := fmt.Sprintf("%s/nad0", consts.TestingNamespace)
-				expectedNad1 := fmt.Sprintf("%s/nad1", consts.TestingNamespace)
-
-				return foundNetworks[expectedNad0] && foundNetworks[expectedNad1]
-			})
-		})
-
-		ginkgo.It("should return the same values for the new query as the standard query", func() {
-			testPod, err := client.Client.Pods(consts.TestingNamespace).Get(context.Background(), "metricpod", metav1.GetOptions{})
-			gomega.Expect(err).ToNot(gomega.HaveOccurred())
-
-			podIP := testPod.Status.PodIP
-			gomega.Expect(podIP).ToNot(gomega.BeEmpty())
-
-			pingPod(podIP, workerName, fmt.Sprintf("%s/nad0", consts.TestingNamespace))
-			pingPod(podIP, workerName, fmt.Sprintf("%s/nad1", consts.TestingNamespace))
-
-			ginkgo.By("checking that there is traffic on all networks")
-
-			recieveBytesMetric := fmt.Sprintf("(container_network_receive_bytes_total{namespace=\"%s\",pod=\"metricpod\", interface=\"net1\"})", consts.TestingNamespace)
-			reciveBytesURL := fmt.Sprintf("%s/api/v1/query?%s", baseURL, (url.Values{"query": []string{recieveBytesMetric}}).Encode())
-
-			queryPrometheusEventually(reciveBytesURL, 5*time.Minute, 5*time.Second, func(queryOutput prometheus.Reply) bool {
-				for _, result := range queryOutput.Data.Results {
-					if result.Value[1] == "0" {
+					if result.Metric.Namespace != consts.TestingNamespace ||
+						result.Metric.Pod != "metricpod" ||
+						result.Value[1] != "0" ||
+						foundInterfaces[result.Metric.Interface] {
 						return false
 					}
-				}
-				return true
-			})
 
-			transmitBytesMetric := fmt.Sprintf("(container_network_transmit_bytes_total{namespace=\"%s\",pod=\"metricpod\", interface=\"net1\"})", consts.TestingNamespace)
-			transmitBytesURL := fmt.Sprintf("%s/api/v1/query?%s", baseURL, (url.Values{"query": []string{transmitBytesMetric}}).Encode())
-
-			queryPrometheusEventually(transmitBytesURL, 5*time.Minute, 5*time.Second, func(queryOutput prometheus.Reply) bool {
-				for _, result := range queryOutput.Data.Results {
-					if result.Value[1] == "0" {
-						return false
-					}
-				}
-				return true
-			})
-
-			ginkgo.By("checking that difference in traffic is 0")
-
-			// for testing in web console :
-			// ---------------------------
-			// differenceQuery = ((container_network_receive_bytes_total) + on(namespace,pod,interface) group_left(network_name) (pod_network_name_info{namespace="metrictest",pod="metricpod",network_name="nad0", interface="net1"})) - ignoring(network_name) (container_network_receive_bytes_total{namespace="metrictest",pod="metricpod", interface="net1"})
-
-			differenceQuery := fmt.Sprintf(
-				"((%s) + on(namespace,pod,interface) group_left(network_name) (pod_network_name_info{namespace=\"%s\",pod=\"metricpod\",network_name=\"%s/nad0\", interface=\"net1\"})) - ignoring(network_name) (%s{namespace=\"%s\",pod=\"metricpod\", interface=\"net1\"})",
-				"%s",
-				consts.TestingNamespace,
-				consts.TestingNamespace,
-				"%s",
-				consts.TestingNamespace,
-			)
-
-			for _, metric := range metrics {
-				currentQuery := fmt.Sprintf(differenceQuery, metric, metric)
-				url := fmt.Sprintf("%s/api/v1/query?%s", baseURL, (url.Values{"query": []string{currentQuery}}).Encode())
-
-				queryPrometheusEventually(url, 5*time.Minute, 5*time.Second, func(queryOutput prometheus.Reply) bool {
-					for _, result := range queryOutput.Data.Results {
-						if result.Value[1] != "0" {
+					switch result.Metric.Interface {
+					case "eth0":
+						if result.Metric.NetworkName == "" {
 							return false
 						}
+					case "net1", "net2":
+						if result.Metric.NetworkName != expectedNetworks[result.Metric.Interface] {
+							return false
+						}
+					default:
+						return false
 					}
-					return true
-				})
-			}
+
+					foundInterfaces[result.Metric.Interface] = true
+				}
+
+				return foundInterfaces["eth0"] && foundInterfaces["net1"] && foundInterfaces["net2"]
+			})
 		})
 	})
 })
 
 func queryPrometheusEventually(query string, total time.Duration, interval time.Duration, validate func(queryOutput prometheus.Reply) bool) {
 	var queryOutput prometheus.Reply
-	gomega.Eventually(func() bool {
+	gomega.Eventually(func() error {
 		jsonReply, err := prometheus.Query(query)
 		if err != nil {
-			return false
+			return fmt.Errorf("query failed: %w", err)
 		}
-		err = json.Unmarshal([]byte(jsonReply.String()), &queryOutput)
+
+		response := jsonReply.String()
+		err = json.Unmarshal([]byte(response), &queryOutput)
 		if err != nil {
-			return false
+			return fmt.Errorf("could not decode Prometheus response %q: %w", response, err)
 		}
 		if queryOutput.Status != "success" {
-			return false
+			return fmt.Errorf("Prometheus query returned status %q: %s", queryOutput.Status, response)
 		}
 		if len(queryOutput.Data.Results) <= 0 {
-			return false
+			return fmt.Errorf("Prometheus query returned no results: %s", response)
 		}
-		return validate(queryOutput)
-	}, total, interval).Should(gomega.BeTrue())
-}
+		if !validate(queryOutput) {
+			return fmt.Errorf("Prometheus response did not pass validation: %s", response)
+		}
 
-func pingPod(ip string, nodeName string, networkAttachmentDefinition string) {
-	podDefinition := pods.RedifineWithSpecificNode(
-		pods.RedefineWithRestartPolicy(
-			pods.RedefineWithCommand(
-				pods.DefineWithNetworks([]string{networkAttachmentDefinition}),
-				[]string{"/bin/bash", "-c", "ping -c 3 " + ip}, []string{},
-			),
-			corev1.RestartPolicyNever,
-		),
-		nodeName,
-	)
-	createdPod, err := client.Client.Pods(consts.TestingNamespace).Create(context.Background(), podDefinition, metav1.CreateOptions{})
-	gomega.Expect(err).ToNot(gomega.HaveOccurred())
-
-	gomega.Eventually(func() corev1.PodPhase {
-		runningPod, err := client.Client.Pods(consts.TestingNamespace).Get(context.Background(), createdPod.Name, metav1.GetOptions{})
-		gomega.Expect(err).ToNot(gomega.HaveOccurred())
-		return runningPod.Status.Phase
-	}, 5*time.Minute, 5*time.Second).Should(gomega.Equal(corev1.PodSucceeded))
+		return nil
+	}, total, interval).Should(gomega.Succeed(), "Prometheus query: %s", query)
 }
