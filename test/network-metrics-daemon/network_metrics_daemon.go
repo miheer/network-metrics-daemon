@@ -25,15 +25,11 @@ const (
 	workerLabel = "node-role.kubernetes.io/worker="
 )
 
-var metrics = []string{
+// These counters are guaranteed to be present after the test generates traffic.
+// Other cAdvisor network counters may not be exposed when they have no samples.
+var trafficMetrics = []string{
 	"container_network_receive_bytes_total",
-	"container_network_receive_errors_total",
-	"container_network_receive_packets_total",
-	"container_network_receive_packets_dropped_total",
 	"container_network_transmit_bytes_total",
-	"container_network_transmit_errors_total",
-	"container_network_transmit_packets_total",
-	"container_network_transmit_packets_dropped_total",
 }
 
 var _ = ginkgo.Describe("NetworkMetricsDaemon", func() {
@@ -117,14 +113,15 @@ var _ = ginkgo.Describe("NetworkMetricsDaemon", func() {
 			ginkgo.By("checking that difference in traffic is 0")
 
 			differenceQuery := fmt.Sprintf(
-				"((%s) + on(namespace,pod,interface) group_left(network_name) (pod_network_name_info{namespace=\"%s\",pod=\"metricpod\"})) - ignoring(network_name) %s{namespace=\"%s\",pod=\"metricpod\", interface=\"eth0\"}",
+				"((%s{namespace=\"%s\",pod=\"metricpod\",interface=\"eth0\"}) + on(namespace,pod,interface) group_left(network_name) (pod_network_name_info{namespace=\"%s\",pod=\"metricpod\"})) - ignoring(network_name) %s{namespace=\"%s\",pod=\"metricpod\",interface=\"eth0\"}",
 				"%s",
+				consts.TestingNamespace,
 				consts.TestingNamespace,
 				"%s",
 				consts.TestingNamespace,
 			)
 
-			for _, metric := range metrics {
+			for _, metric := range trafficMetrics {
 				currentQuery := fmt.Sprintf(differenceQuery, metric, metric)
 				url := fmt.Sprintf("%s/api/v1/query?%s", baseURL, (url.Values{"query": []string{currentQuery}}).Encode())
 
@@ -320,15 +317,16 @@ var _ = ginkgo.Describe("NetworkMetricsDaemon", func() {
 			// differenceQuery = ((container_network_receive_bytes_total) + on(namespace,pod,interface) group_left(network_name) (pod_network_name_info{namespace="metrictest",pod="metricpod",network_name="nad0", interface="net1"})) - ignoring(network_name) (container_network_receive_bytes_total{namespace="metrictest",pod="metricpod", interface="net1"})
 
 			differenceQuery := fmt.Sprintf(
-				"((%s) + on(namespace,pod,interface) group_left(network_name) (pod_network_name_info{namespace=\"%s\",pod=\"metricpod\",network_name=\"%s/nad0\", interface=\"net1\"})) - ignoring(network_name) (%s{namespace=\"%s\",pod=\"metricpod\", interface=\"net1\"})",
+				"((%s{namespace=\"%s\",pod=\"metricpod\",interface=\"net1\"}) + on(namespace,pod,interface) group_left(network_name) (pod_network_name_info{namespace=\"%s\",pod=\"metricpod\",network_name=\"%s/nad0\",interface=\"net1\"})) - ignoring(network_name) (%s{namespace=\"%s\",pod=\"metricpod\",interface=\"net1\"})",
 				"%s",
+				consts.TestingNamespace,
 				consts.TestingNamespace,
 				consts.TestingNamespace,
 				"%s",
 				consts.TestingNamespace,
 			)
 
-			for _, metric := range metrics {
+			for _, metric := range trafficMetrics {
 				currentQuery := fmt.Sprintf(differenceQuery, metric, metric)
 				url := fmt.Sprintf("%s/api/v1/query?%s", baseURL, (url.Values{"query": []string{currentQuery}}).Encode())
 
@@ -347,23 +345,29 @@ var _ = ginkgo.Describe("NetworkMetricsDaemon", func() {
 
 func queryPrometheusEventually(query string, total time.Duration, interval time.Duration, validate func(queryOutput prometheus.Reply) bool) {
 	var queryOutput prometheus.Reply
-	gomega.Eventually(func() bool {
+	gomega.Eventually(func() error {
 		jsonReply, err := prometheus.Query(query)
 		if err != nil {
-			return false
+			return fmt.Errorf("query failed: %w", err)
 		}
-		err = json.Unmarshal([]byte(jsonReply.String()), &queryOutput)
+
+		response := jsonReply.String()
+		err = json.Unmarshal([]byte(response), &queryOutput)
 		if err != nil {
-			return false
+			return fmt.Errorf("could not decode Prometheus response %q: %w", response, err)
 		}
 		if queryOutput.Status != "success" {
-			return false
+			return fmt.Errorf("Prometheus query returned status %q: %s", queryOutput.Status, response)
 		}
 		if len(queryOutput.Data.Results) <= 0 {
-			return false
+			return fmt.Errorf("Prometheus query returned no results: %s", response)
 		}
-		return validate(queryOutput)
-	}, total, interval).Should(gomega.BeTrue())
+		if !validate(queryOutput) {
+			return fmt.Errorf("Prometheus response did not pass validation: %s", response)
+		}
+
+		return nil
+	}, total, interval).Should(gomega.Succeed(), "Prometheus query: %s", query)
 }
 
 func pingPod(ip string, nodeName string, networkAttachmentDefinition string) {
